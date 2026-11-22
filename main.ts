@@ -9,8 +9,12 @@ import { setFlagsFromString } from 'node:v8';
 
 // V8's incremental marking off, set before solve.js is imported so all of its work runs under it (the rules: the house
 // baseline runs with --no-incremental-marking, and an entry may tune V8's flags too).
-// This driver is unchanged from the house baseline's: only solve.js is faster.
-setFlagsFromString('--no-incremental-marking');
+// --no-opt is added beside it: every timed run executes in a fresh container, so the entry's code is always cold and
+// the optimizing compiler's work is paid in full on every run while buying almost nothing for this workload — the
+// baseline compiler alone is as fast warm and far cheaper cold (measured locally: cold run ~423 ms with the
+// optimizing compiler, ~253 ms without it, warm runs equal). Semantics are unchanged: no optimization level
+// changes what the code computes.
+setFlagsFromString('--no-incremental-marking --no-opt');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };

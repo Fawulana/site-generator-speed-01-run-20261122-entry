@@ -1,4 +1,4 @@
-// Fast drop-in for makefun-site 1.0.0 — tuned v2.
+// Fast drop-in for makefun-site 1.0.0 — tuned v3 (tuning round 3).
 //
 // Same answers, byte for byte, for every input — reimplemented here from the
 // published semantics (front matter, template dialect, Markdown subset, slug
@@ -7,11 +7,17 @@
 //  * Markdown is rendered in one fused pass over the lines (no token array,
 //    no per-block object allocations); inline rendering uses ONE regex scan
 //    for all nine special characters, so the plain runs between matches
-//    contain no HTML special and need no escaping pass at all.
-//  * The line scan that splits a body also counts its words in the same
-//    pass, so reading_minutes costs no second pass over the body.
-//  * HTML escaping is a single regex test plus a hand scan, and returns the
-//    original string untouched when nothing needs escaping.
+//    contain no HTML special and need no escaping pass at all. A string
+//    with no special at all is returned untouched (no output array).
+//  * HTML escaping is a single regex exec loop (one native scan, no
+//    replace callback), and returns the original string untouched when
+//    nothing needs escaping.
+//  * Template variable lookup takes a direct property load for the first
+//    segment, falling back to the hasOwn scope walk only when undefined.
+//  * Each page render hangs its vars off one shared per-case scope holding
+//    site/tags/recent, instead of spreading those into a fresh object.
+//  * The table of contents is passed through as-is: its entries already
+//    have the output shape, so pageOf copies nothing.
 //  * slugify takes an ASCII fast path (no NFKD / mark stripping when the
 //    text is pure ASCII) and memoises every distinct string within one case
 //    only — the cache is rebuilt for every run() call, never shared across
@@ -32,7 +38,11 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 
 const RESERVED = ['posts', 'tags', 'page'];
 const KEYS = new Set(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const HAS_SPECIAL = /[&<>"']/;
+// One regex, one native scan: the exec loop below pushes the plain runs
+// between matches and the entity for each match, so a string with specials
+// is scanned once (the old test()+replace() scanned it twice, and the
+// replace callback ran per match).
+const ESC_RE = /[&<>"']/g;
 
 // Whitespace code units, by the same set wordsOf used: JS \s.
 const WS = new Uint8Array(65536);
@@ -49,7 +59,18 @@ const dirOf = (p) => { const i = p.lastIndexOf('/'); return i === -1 ? '' : p.sl
 let slugCache = null;
 
 function esc(s) {
-  return HAS_SPECIAL.test(s) ? s.replace(/[&<>"']/g, (c) => ESC[c]) : s;
+  ESC_RE.lastIndex = 0;
+  let m = ESC_RE.exec(s);
+  if (m === null) return s;
+  const out = [];
+  let i = 0;
+  do {
+    if (m.index > i) out.push(s.slice(i, m.index));
+    out.push(ESC[m[0]]);
+    i = m.index + 1;
+  } while ((m = ESC_RE.exec(s)) !== null);
+  if (i < s.length) out.push(s.slice(i));
+  return out.join('');
 }
 
 function slugify(text) {
@@ -352,64 +373,65 @@ function findSingleStar(s, from) {
 const ALL = /[\\`*&<>"'[]/g;
 
 function inline(s, env) {
-  // An output array joined once at the end: the result is a flat string,
-  // which matters because main.ts JSON-stringifies every answer — a lazy
-  // cons-string would only be flattened there, at a higher total cost.
+  // One scan for every character inline Markdown or HTML escaping cares
+  // about: \ ` * [ and & < > " '. The plain run between two matches holds
+  // none of them, so it is pushed as-is — no escaping pass over it.
+  // (The class is written [\\`*&<>"'[]: the '[' before the closing ']' is
+  // a literal member, so the class holds all nine characters.)
+  // No special at all is the common paragraph: return the string itself
+  // instead of allocating an output array and joining one element.
+  ALL.lastIndex = 0;
+  let m = ALL.exec(s);
+  if (m === null) return s;
   const out = [];
   let i = 0;
-  ALL.lastIndex = 0;
-  while (i < s.length) {
-    ALL.lastIndex = i;
-    const m = ALL.exec(s);
-    const j = m === null ? s.length : m.index;
+  for (;;) {
+    const j = m.index;
     if (j > i) out.push(s.slice(i, j));
-    if (m === null) break;
     i = j;
     const c = s[i];
-    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") { out.push(ESC[c]); i++; continue; }
-    if (c === '\\' && i + 1 < s.length) {
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") { out.push(ESC[c]); i++; }
+    else if (c === '\\' && i + 1 < s.length) {
       const c1 = s.charCodeAt(i + 1);
-      if (c1 < 128 && ESC_TBL[c1]) { out.push(ESC[s[i + 1]] || s[i + 1]); i += 2; continue; }
+      if (c1 < 128 && ESC_TBL[c1]) { out.push(ESC[s[i + 1]] || s[i + 1]); i += 2; }
+      else { out.push('\\'); i++; }
     }
-    if (c === '`') {
+    else if (c === '`') {
       const k = s.indexOf('`', i + 1);
       if (k > i + 1) {
         out.push('<code>', esc(s.slice(i + 1, k)), '</code>');
         i = k + 1;
       } else { out.push('`'); i++; }
-      continue;
     }
-    if (c === '*') {
+    else if (c === '*') {
       if (s[i + 1] === '*') {
         const k = findUnescaped(s, '**', i + 2);
         if (k > i + 2) {
           out.push('<strong>', inline(s.slice(i + 2, k), env), '</strong>');
           i = k + 2;
         } else { out.push('**'); i += 2; }
-        continue;
+      } else {
+        const k = findSingleStar(s, i + 1);
+        if (k > i + 1) {
+          out.push('<em>', inline(s.slice(i + 1, k), env), '</em>');
+          i = k + 1;
+        } else { out.push('*'); i++; }
       }
-      const k = findSingleStar(s, i + 1);
-      if (k > i + 1) {
-        out.push('<em>', inline(s.slice(i + 1, k), env), '</em>');
-        i = k + 1;
-      } else { out.push('*'); i++; }
-      continue;
     }
-    if (c === '[') {
+    else if (c === '[') {
       const k = findUnescaped(s, ']', i + 1);
       const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !/\s/.test(target)) {
         out.push('<a href="', esc(env.link(target)), '">', inline(s.slice(i + 1, k), env), '</a>');
         i = mm + 1;
-        continue;
-      }
-      out.push('[');
-      i++;
-      continue;
+      } else { out.push('['); i++; }
     }
-    out.push('\\');
-    i++;
+    else { out.push('\\'); i++; }
+    if (i >= s.length) break;
+    ALL.lastIndex = i;
+    m = ALL.exec(s);
+    if (m === null) { out.push(s.slice(i)); break; }
   }
   return out.join('');
 }
@@ -611,10 +633,17 @@ function parseTemplate(name, src) {
 }
 
 function lookup(scope, path) {
-  let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
-  if (s === null) return undefined;
-  let v = s.vars[path[0]];
+  // Fast path: the first segment almost always lives in the innermost
+  // scope, so one property load finds it. Only when that load is
+  // undefined do the hasOwn walk — which also covers a scope that holds
+  // the key with an undefined value, and a key that lives in a parent.
+  let v = scope.vars[path[0]];
+  if (v === undefined) {
+    let s = scope;
+    while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
+    if (s === null) return undefined;
+    v = s.vars[path[0]];
+  }
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -856,7 +885,9 @@ export function run(input) {
       ...card,
       slug: s.slug,
       content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      // The toc entries already have exactly the output shape
+      // {level, id, html} and nothing mutates them, so no copy is needed.
+      toc: s.toc,
       newer: linkOf(s.newer !== undefined && s.newer !== null ? s.newer : null),
       older: linkOf(s.older !== undefined && s.older !== null ? s.older : null),
       is_post: s.post,
@@ -866,11 +897,16 @@ export function run(input) {
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const ctx = { templates };
+  // One scope for the case-wide names (site/tags/recent); each render
+  // hangs its own vars off it instead of copying the case-wide names
+  // into a fresh object per page. The render vars (page/posts/tag/pager)
+  // never collide with the case-wide names, so lookups resolve the same.
+  const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    renderNodes(nodes, { vars, parent: baseScope }, ctx, 0, out);
     return out.join('');
   };
   for (const s of kept) output[s.outDir + '/index.html'] = render(s.layout, { page: pageOf(s) });

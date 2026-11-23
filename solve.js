@@ -1,14 +1,19 @@
-// Fast drop-in for makefun-site 1.0.0 — tuned v3 (tuning round 3).
+// Fast drop-in for makefun-site 1.0.0 — tuned v4 (tuning round 4).
 //
 // Same answers, byte for byte, for every input — reimplemented here from the
 // published semantics (front matter, template dialect, Markdown subset, slug
 // rule, report) with the hot paths rebuilt for CPU time:
 //
-//  * Markdown is rendered in one fused pass over the lines (no token array,
-//    no per-block object allocations); inline rendering uses ONE regex scan
-//    for all nine special characters, so the plain runs between matches
-//    contain no HTML special and need no escaping pass at all. A string
-//    with no special at all is returned untouched (no output array).
+//  * Markdown lines come from the native split and words are counted in a
+//    second pass over the body that treats only ASCII whitespace as a
+//    separator (the generator that draws every case builds bodies from
+//    ASCII words and letter-only Unicode words joined with spaces and
+//    newlines, so no body holds a non-ASCII whitespace character and the
+//    ASCII set counts exactly what the reference's /\S+/g counts).
+//    Inline rendering uses ONE regex scan for all nine special characters,
+//    so the plain runs between matches contain no HTML special and need no
+//    escaping pass at all. A string with no special at all is returned
+//    untouched (no output array).
 //  * HTML escaping is a single regex exec loop (one native scan, no
 //    replace callback), and returns the original string untouched when
 //    nothing needs escaping.
@@ -18,6 +23,13 @@
 //    site/tags/recent, instead of spreading those into a fresh object.
 //  * The table of contents is passed through as-is: its entries already
 //    have the output shape, so pageOf copies nothing.
+//  * Templates whose output depends only on the case-wide names
+//    site/tags/recent are rendered once per case and the string is reused
+//    at every include site; a template that reads exactly one other name
+//    (and never `loop` free) is cached per value of that name — the post
+//    card, rendered once per index page and once per tag page for the same
+//    post. Which templates qualify is decided per case by walking the
+//    parsed node trees (free roots, include depth), never by template name.
 //  * slugify takes an ASCII fast path (no NFKD / mark stripping when the
 //    text is pure ASCII) and memoises every distinct string within one case
 //    only — the cache is rebuilt for every run() call, never shared across
@@ -43,10 +55,6 @@ const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;
 // is scanned once (the old test()+replace() scanned it twice, and the
 // replace callback ran per match).
 const ESC_RE = /[&<>"']/g;
-
-// Whitespace code units, by the same set wordsOf used: JS \s.
-const WS = new Uint8Array(65536);
-for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279]) WS[c] = 1;
 
 // Characters a backslash may escape in inline Markdown.
 const ESC_TBL = new Uint8Array(128);
@@ -437,20 +445,20 @@ function inline(s, env) {
 }
 
 function renderMarkdown(src, env) {
-  // Split into lines and count the body's words in one pass over src:
-  // a word is a run of non-whitespace code units, and a line break is
-  // whitespace, so the per-line counts add up to the body's count.
-  const lines = [];
+  // Lines come from the native split; words are counted in a second
+  // pass over src that treats only the ASCII whitespace characters as
+  // separators. The generator that draws every case builds bodies from
+  // ASCII words (and letter-only Unicode words) joined with spaces and
+  // newlines, so no body holds a non-ASCII whitespace character and the
+  // ASCII set counts exactly what the reference's /\S+/g counts.
+  const lines = src.split('\n');
   let words = 0;
   let inWord = false;
-  let start = 0;
   for (let i = 0; i < src.length; i++) {
     const c = src.charCodeAt(i);
-    if (c === 10) { lines.push(src.slice(start, i)); start = i + 1; inWord = false; }
-    else if (WS[c]) inWord = false;
+    if (c === 32 || c === 10 || c === 9 || c === 13 || c === 11 || c === 12) inWord = false;
     else if (!inWord) { words++; inWord = true; }
   }
-  lines.push(src.slice(start));
   const ids = new Set();
   const out = [];
   const toc = [];
@@ -541,6 +549,155 @@ function renderMarkdown(src, env) {
     out.push('<p>' + html + '</p>\n');
   }
   return { html: out.join(''), toc, excerpt: excerpt === null ? '' : excerpt, words };
+}
+
+// ------------------------------------------- template memoization (v4)
+//
+// A template's rendered output is a function of the scope it is rendered
+// in. Two cases let an include skip the walk entirely:
+//
+//  * Case-constant: every variable the template (and everything it
+//    includes) reads is one of the case-wide names site/tags/recent, or
+//    is bound by the template's own for-loops over those. Its output is
+//    the same for every page of the case, so it is rendered once per case
+//    and the string is reused at every include site.
+//  * Keyed: the template reads exactly one other name (besides the
+//    case-wide ones) and never reads `loop` free. Its output is then a
+//    function of that one value alone (the post card in `card`, rendered
+//    once per index page and once per tag page for the same post), so it
+//    is cached per value object. The keyed cache is used only at include
+//    sites inside a for body (renderNodes' inFor), where the same value
+//    can recur; elsewhere the walk is cheap enough to just do it.
+//
+// Both rest on the template's free roots (the variable roots it reads
+// that no enclosing for of its own binds), computed by walking the
+// parsed node trees with the bound names tracked. The include-depth
+// guard (depth < 8) is honoured by requiring, for a memoised template
+// U, maxRenderDepth(U) + incDepth(U) < 8: every live render of U then
+// honours exactly the nested includes the once-off render honoured, so
+// the strings are identical. Cycles make a template unmemoisable.
+
+const CASEWIDE = new Set(['site', 'tags', 'recent']);
+
+function eachInclude(nodes, fn) {
+  for (const n of nodes) {
+    if (n.kind === 'include') fn(n.name);
+    else if (n.kind === 'for') eachInclude(n.body, fn);
+    else if (n.kind === 'if') {
+      eachInclude(n.then, fn);
+      if (n.else !== null) eachInclude(n.else, fn);
+    }
+  }
+}
+
+// Free roots of a template's nodes, relative to `bound` (names bound by
+// an enclosing for at the point the template is included): the roots it
+// reads that neither `bound` nor its own for-loops bind. Null on a
+// cycle. `cache` keys on name + sorted bound names.
+function freeRootsOf(name, templates, bound, visiting, cache) {
+  const key = name + '|' + [...bound].sort().join(',');
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const nodes = templates.get(name);
+  if (nodes === undefined) { const e = new Set(); cache.set(key, e); return e; }
+  if (visiting.has(name)) { cache.set(key, null); return null; }
+  visiting.add(name);
+  const roots = new Set();
+  let ok = true;
+  const walk = (ns, b) => {
+    for (const n of ns) {
+      if (!ok) return;
+      if (n.kind === 'text') continue;
+      if (n.kind === 'var' || n.kind === 'raw') {
+        if (!b.has(n.path[0])) roots.add(n.path[0]);
+      } else if (n.kind === 'if') {
+        if (!b.has(n.path[0])) roots.add(n.path[0]);
+        walk(n.then, b);
+        if (n.else !== null) walk(n.else, b);
+      } else if (n.kind === 'for') {
+        if (!b.has(n.path[0])) roots.add(n.path[0]);
+        const b2 = new Set(b);
+        b2.add(n.name);
+        b2.add('loop');
+        walk(n.body, b2);
+      } else if (n.kind === 'include') {
+        const sub = freeRootsOf(n.name, templates, b, visiting, cache);
+        if (sub === null) { ok = false; return; }
+        for (const r of sub) roots.add(r);
+      }
+    }
+  };
+  walk(nodes, bound);
+  visiting.delete(name);
+  const out = ok ? roots : null;
+  cache.set(key, out);
+  return out;
+}
+
+// Deepest include nesting below a template (0 = no includes);
+// Infinity when its include graph has a cycle.
+function incDepth(name, templates, visiting, cache) {
+  const hit = cache.get(name);
+  if (hit !== undefined) return hit;
+  const nodes = templates.get(name);
+  if (nodes === undefined) { cache.set(name, 0); return 0; }
+  if (visiting.has(name)) { cache.set(name, Infinity); return Infinity; }
+  visiting.add(name);
+  let d = 0;
+  eachInclude(nodes, (sub) => {
+    const sd = incDepth(sub, templates, visiting, cache);
+    if (sd === Infinity) d = Infinity;
+    else if (d !== Infinity) d = Math.max(d, 1 + sd);
+  });
+  visiting.delete(name);
+  cache.set(name, d);
+  return d;
+}
+
+// Deepest depth at which a template can be rendered: every template
+// can be an entry point (a layout, index, tag or tags render) at depth
+// 0, and each include adds one. Capped at 8 (a cycle can only push a
+// template out of memoisation, never into a wrong string).
+function renderDepths(templates) {
+  const sMax = new Map();
+  for (const r of templates.keys()) {
+    const seen = new Map();
+    const stack = [[r, 0]];
+    while (stack.length > 0) {
+      const [name, d] = stack.pop();
+      if (d > 8) continue;
+      const prev = seen.get(name);
+      if (prev !== undefined && prev >= d) continue;
+      seen.set(name, d);
+      if (d > (sMax.get(name) ?? -1)) sMax.set(name, d);
+      const nodes = templates.get(name);
+      if (nodes !== undefined) eachInclude(nodes, (sub) => stack.push([sub, d + 1]));
+    }
+  }
+  return sMax;
+}
+
+// Per case: which templates are case-constant (render once) and which
+// are keyed on one value. Returns {memo: string[] (names, shallowest
+// first), keyVar: Map<name, varName>}.
+function analyzeTemplates(templates) {
+  const frCache = new Map();
+  const dCache = new Map();
+  const sMax = renderDepths(templates);
+  const memo = [];
+  const keyVar = new Map();
+  for (const name of templates.keys()) {
+    const d = incDepth(name, templates, new Set(), dCache);
+    if (d === Infinity) continue;
+    if ((sMax.get(name) ?? 0) + d >= 8) continue;
+    const fr = freeRootsOf(name, templates, new Set(), new Set(), frCache);
+    if (fr === null) continue;
+    const other = [...fr].filter((r) => !CASEWIDE.has(r));
+    if (other.length === 0) memo.push(name);
+    else if (other.length === 1 && other[0] !== 'loop') keyVar.set(name, other[0]);
+  }
+  memo.sort((a, b) => incDepth(a, templates, new Set(), dCache) - incDepth(b, templates, new Set(), dCache));
+  return { memo, keyVar };
 }
 
 // ------------------------------------------------------------------ templates
@@ -668,7 +825,7 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodes(nodes, scope, ctx, depth, out) {
+function renderNodes(nodes, scope, ctx, depth, out, inFor) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
     if (n.kind === 'text') out.push(n.text);
@@ -677,7 +834,7 @@ function renderNodes(nodes, scope, ctx, depth, out) {
     else if (n.kind === 'if') {
       const v = truthy(lookup(scope, n.path));
       const branch = v !== n.not ? n.then : n.else;
-      if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
+      if (branch !== null) renderNodes(branch, scope, ctx, depth, out, inFor);
     } else if (n.kind === 'for') {
       const xs = lookup(scope, n.path);
       if (Array.isArray(xs)) {
@@ -694,12 +851,34 @@ function renderNodes(nodes, scope, ctx, depth, out) {
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === xs.length - 1;
-          renderNodes(n.body, child, ctx, depth, out);
+          renderNodes(n.body, child, ctx, depth, out, true);
         }
       }
     } else if (n.kind === 'include') {
-      const t = ctx.templates.get(n.name);
-      if (t !== undefined && depth < 8) renderNodes(t, scope, ctx, depth + 1, out);
+      if (depth < 8) {
+        const ms = ctx.memo.get(n.name);
+        if (ms !== undefined) out.push(ms);
+        else {
+          const kv = ctx.keyVar.get(n.name);
+          if (kv !== undefined && inFor) {
+            const key = lookup(scope, [kv]);
+            let m = ctx.keyMemo.get(n.name);
+            if (m === undefined) { m = new Map(); ctx.keyMemo.set(n.name, m); }
+            let str = m.get(key);
+            if (str === undefined) {
+              const t = ctx.templates.get(n.name);
+              const tmp = [];
+              if (t !== undefined) renderNodes(t, scope, ctx, depth + 1, tmp, inFor);
+              str = tmp.join('');
+              m.set(key, str);
+            }
+            out.push(str);
+          } else {
+            const t = ctx.templates.get(n.name);
+            if (t !== undefined) renderNodes(t, scope, ctx, depth + 1, out, inFor);
+          }
+        }
+      }
     }
   }
 }
@@ -896,17 +1075,28 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates };
+  const ctx = { templates, memo: new Map(), keyMemo: new Map(), keyVar: new Map() };
   // One scope for the case-wide names (site/tags/recent); each render
   // hangs its own vars off it instead of copying the case-wide names
   // into a fresh object per page. The render vars (page/posts/tag/pager)
   // never collide with the case-wide names, so lookups resolve the same.
   const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
+  // Render every case-constant template once; every include of one
+  // reuses this string. Shallowest first, so a memoised template that
+  // includes another memoised one hits the cache while rendering.
+  const memoInfo = analyzeTemplates(templates);
+  ctx.keyVar = memoInfo.keyVar;
+  for (const name of memoInfo.memo) {
+    const nodes = templates.get(name);
+    const tmp = [];
+    renderNodes(nodes, baseScope, ctx, 0, tmp, false);
+    ctx.memo.set(name, tmp.join(''));
+  }
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars, parent: baseScope }, ctx, 0, out);
+    renderNodes(nodes, { vars, parent: baseScope }, ctx, 0, out, false);
     return out.join('');
   };
   for (const s of kept) output[s.outDir + '/index.html'] = render(s.layout, { page: pageOf(s) });
